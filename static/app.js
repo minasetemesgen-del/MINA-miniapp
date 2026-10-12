@@ -240,7 +240,7 @@
     html += `<div class="card"><h3 style="margin-bottom:6px">How it works</h3><ol class="steps">
       <li><div><b>Link your FPL team</b><div class="muted small">One time only.</div></div></li>
       <li><div><b>Pay ${d.fee} birr</b><div class="muted small">Telebirr, CBE Birr or card — confirmed automatically.</div></div></li>
-      <li><div><b>Highest score wins</b><div class="muted small">The best gameweek score wins the prize.</div></div></li>
+      <li><div><b>Top 3 win</b><div class="muted small">The three best gameweek scores win prizes.</div></div></li>
     </ol></div></div>`;
 
     view.innerHTML = html;
@@ -272,7 +272,7 @@
       <div class="stats${d.is_admin ? "" : " single"}">
         <div class="stat"><b>${d.fee}</b><span>Entry (birr)</span></div>
         ${d.is_admin ? `<div class="stat"><b>${e.pot.toLocaleString()}</b><span>Pot (birr)</span></div>
-        <div class="stat"><b>${e.prize.toLocaleString()}</b><span>Prize (birr)</span></div>` : ""}
+        <div class="stat"><b>${e.prize.toLocaleString()}</b><span>Prizes (birr)</span></div>` : ""}
       </div>
       ${cta}
       ${d.is_admin ? `<div class="sub center" style="margin-top:10px">${e.entrants} player${e.entrants === 1 ? "" : "s"} entered so far</div>` : ""}
@@ -357,14 +357,16 @@
     return `<div class="lb-row ${r.is_me ? "me" : ""}">
       <div class="rank">${r.rank}</div>${avatar(r.name)}
       <div class="grow"><b class="ellipsis" style="display:block">${esc(r.name)}${r.is_me ? ' <span class="pill ok" style="margin-left:4px">You</span>' : ""}</b>
-      <span class="muted small ellipsis" style="display:block">${esc(r.team_name || "")}</span></div>
-      <div class="score">${r.points}<span class="muted small" style="font-weight:600"> pts</span></div></div>`;
+      <span class="muted small ellipsis" style="display:block">${esc(r.team_name || "")}${r.fpl_id ? ` · ID ${r.fpl_id}` : ""}</span></div>
+      <div style="text-align:right"><div class="score">${r.points}<span class="muted small" style="font-weight:600"> pts</span></div>
+      ${r.prize ? `<div class="small" style="font-weight:800;color:var(--accent)">${r.prize.toLocaleString()} birr</div>` : ""}</div></div>`;
   }
   function paintBoard(d) {
     if (!d.gameweek) { view.innerHTML = emptyState("🏆", "No gameweek yet", "The leaderboard appears once the season starts."); return; }
     let html = `<div class="stack fade-in">
       <div class="card"><div class="row between"><div><div class="muted small">Gameweek ${d.gameweek}</div><h2 style="font-size:22px">Top 10</h2></div>
-        <div style="text-align:right"><div class="muted small">Prize</div><b style="font-size:20px;color:var(--accent)">${d.prize.toLocaleString()} birr</b></div></div>
+        <div style="text-align:right"><div class="muted small" style="margin-bottom:2px">Prizes</div>
+          ${["🥇", "🥈", "🥉"].map((m, i) => `<div style="font-weight:800;font-size:15px;line-height:1.45;color:var(--accent)">${m} ${(d.prizes[i] || 0).toLocaleString()} <span class="muted small" style="font-weight:600">birr</span></div>`).join("")}</div></div>
         ${d.is_admin ? `<div class="muted small" style="margin-top:6px">${d.entrants} player${d.entrants === 1 ? "" : "s"} · pot ${d.pot.toLocaleString()} birr</div>` : ""}</div>`;
 
     if (!d.top.length) {
@@ -377,7 +379,7 @@
     if (d.top.length >= 3) {
       const [a, b, c] = d.top;
       const spot = (p, cls, color, h) =>
-        `<div class="spot ${cls}" style="--ring:${color}">${avatar(p.name)}<div class="name ellipsis">${esc(p.name)}</div><div class="pts">${p.points} pts</div><div class="bar" style="height:${h}px">${p.rank}</div></div>`;
+        `<div class="spot ${cls}" style="--ring:${color}">${avatar(p.name)}<div class="name ellipsis">${esc(p.name)}</div><div class="pts">${p.points} pts</div>${p.prize ? `<div class="pts" style="color:var(--accent);font-weight:800">${p.prize.toLocaleString()} birr</div>` : ""}${p.fpl_id ? `<div class="pts">ID ${p.fpl_id}</div>` : ""}<div class="bar" style="height:${h}px">${p.rank}</div></div>`;
       html += `<div class="card"><div class="podium">${spot(b, "second", "var(--silver)", 64)}${spot(a, "first", "var(--gold)", 92)}${spot(c, "third", "var(--bronze)", 46)}</div></div>`;
       rest = d.top.slice(3);
     }
