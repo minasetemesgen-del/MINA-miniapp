@@ -20,7 +20,8 @@ from config import CHAPA_RETURN_URL, CHAPA_SECRET_KEY, ENTRY_FEE_BIRR
 logger = logging.getLogger(__name__)
 
 DB_PATH = os.environ.get("DB_PATH", "fpl_contest.db")
-PRIZE_SHARE = 0.5  # winner gets 50% of the pot
+PRIZE_SPLIT = (0.25, 0.15, 0.10)  # 1st, 2nd, 3rd place share of the pot
+PRIZE_SHARE = sum(PRIZE_SPLIT)  # total paid out (50% of the pot)
 
 FPL_API = "https://fantasy.premierleague.com/api"
 CHAPA_INITIALIZE_URL = "https://api.chapa.co/v1/transaction/initialize"
@@ -445,6 +446,31 @@ def record_prize(telegram_id, gameweek, amount):
         "INSERT OR REPLACE INTO prizes (telegram_id, gameweek, amount, created_at) VALUES (?, ?, ?, ?)",
         (telegram_id, gameweek, int(round(amount)), int(time.time())),
     )
+
+
+def prize_allocation(results, pot):
+    """Who wins what: {telegram_id: birr}. `results` is the ranked leaderboard
+    (ties share a rank). Players tied across prize places split those places
+    equally — e.g. two tied for 1st share the 1st + 2nd prizes, and the next
+    player is 3rd."""
+    out = {}
+    i = 0
+    while i < len(results):
+        rank = results[i]["rank"]
+        group = [r for r in results[i:] if r["rank"] == rank]
+        share = sum(PRIZE_SPLIT[p - 1] for p in range(rank, rank + len(group)) if p <= len(PRIZE_SPLIT))
+        if share:
+            for r in group:
+                out[r["telegram_id"]] = round(pot * share / len(group))
+        i += len(group)
+    return out
+
+
+def set_gameweek_prizes(gameweek, allocation):
+    """Saves a gameweek's prizes (replacing any earlier announcement of the same gameweek)."""
+    db_execute("DELETE FROM prizes WHERE gameweek=?", (gameweek,))
+    for telegram_id, amount in allocation.items():
+        record_prize(telegram_id, gameweek, amount)
 
 
 def wallet_data(telegram_id):
