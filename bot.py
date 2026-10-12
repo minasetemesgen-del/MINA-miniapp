@@ -258,24 +258,38 @@ async def announce_winner(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"No confirmed entries for GW{gw}.")
         return
 
-    winner = results[0]
     total_pot = len(results) * ENTRY_FEE_BIRR
-    prize = total_pot * core.PRIZE_SHARE
+    prizes = core.prize_allocation(results, total_pot)
+    winners = [r for r in results if r["telegram_id"] in prizes]
+    core.set_gameweek_prizes(gw, prizes)  # shows up in each winner's Wallet
 
-    core.record_prize(winner["telegram_id"], gw, prize)  # shows up in the winner's Wallet
-    await update.message.reply_text(
-        f"🏆 GW{gw} Winner: {winner['username']} with {winner['points']} points!\n"
-        f"Pot: {total_pot} birr → Prize: {prize:.0f} birr (50%)"
-    )
-    await context.bot.send_message(
-        winner["telegram_id"],
-        f"🎉 Congrats! You won GW{gw} with {winner['points']} points. Prize: {prize:.0f} birr!",
-    )
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    lines = [f"🏆 GW{gw} winners — pot {total_pot} birr"]
+    for r in winners:
+        lines.append(
+            f"{medals.get(r['rank'], '🏅')} #{r['rank']} {r['username']} — {r['points']} pts — "
+            f"{prizes[r['telegram_id']]} birr — FPL ID {r['team_id']}"
+        )
+    if len(winners) < len(core.PRIZE_SPLIT):
+        lines.append("(Fewer than 3 entrants — unused prize places are not paid out.)")
+    await update.message.reply_text("\n".join(lines))
+
+    for r in winners:
+        try:
+            await context.bot.send_message(
+                r["telegram_id"],
+                f"🎉 Congrats! You finished #{r['rank']} in GW{gw} with {r['points']} points. "
+                f"Prize: {prizes[r['telegram_id']]} birr!",
+            )
+        except Exception:
+            logger.warning("Could not message winner %s", r["telegram_id"])
+
     # Everyone who entered also gets it in their in-app notifications.
+    names = ", ".join(f"{medals.get(r['rank'], '🏅')} {r['username']}" for r in winners)
     for r in results:
         core.add_notification(
-            r["telegram_id"], "winner", f"GW{gw} winner: {winner['username']}",
-            f"{winner['username']} won with {winner['points']} points. You finished #{r['rank']} with {r['points']}.",
+            r["telegram_id"], "winner", f"GW{gw} winners",
+            f"{names}. You finished #{r['rank']} with {r['points']} points.",
         )
 
 
