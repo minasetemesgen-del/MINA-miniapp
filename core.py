@@ -1,12 +1,13 @@
 """
 Shared logic used by BOTH the Telegram bot and the Mini App API:
-database, FPL API access (with caching), Chapa payments, notifications and
+database, FPL API access (with caching), Telebirr payments, wallet, notifications and
 the contest leaderboard. Keeping it in one place means the bot and the app
 can never disagree about who is entered or who is winning.
 """
 
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -15,7 +16,7 @@ from datetime import datetime, timezone
 
 import requests
 
-from config import CHAPA_RETURN_URL, CHAPA_SECRET_KEY, ENTRY_FEE_BIRR
+from config import ENTRY_FEE_BIRR, MIN_WITHDRAWAL, SMS_ALLOWED_SENDERS, SMS_EXTRA_KEYWORDS
 
 logger = logging.getLogger(__name__)
 
@@ -24,8 +25,6 @@ PRIZE_SPLIT = (0.25, 0.15, 0.10)  # 1st, 2nd, 3rd place share of the pot
 PRIZE_SHARE = sum(PRIZE_SPLIT)  # total paid out (50% of the pot)
 
 FPL_API = "https://fantasy.premierleague.com/api"
-CHAPA_INITIALIZE_URL = "https://api.chapa.co/v1/transaction/initialize"
-CHAPA_VERIFY_URL = "https://api.chapa.co/v1/transaction/verify/{tx_ref}"
 
 HTTP = requests.Session()
 HTTP.headers.update({"User-Agent": "Mozilla/5.0 (compatible; ETFPL-MiniApp/1.0)"})
@@ -108,6 +107,38 @@ def init_db():
             amount INTEGER,
             created_at INTEGER,
             PRIMARY KEY (telegram_id, gameweek)
+        )"""
+    )
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS incoming_payments (
+            tx_id TEXT PRIMARY KEY,
+            amount REAL,
+            sender_name TEXT,
+            message TEXT,
+            received_at INTEGER,
+            status TEXT DEFAULT 'unused',
+            used_by INTEGER,
+            used_at INTEGER
+        )"""
+    )
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS withdrawals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER,
+            amount INTEGER,
+            account TEXT,
+            status TEXT DEFAULT 'pending',
+            created_at INTEGER,
+            resolved_at INTEGER
+        )"""
+    )
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS wallet_credits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER,
+            amount INTEGER,
+            reason TEXT,
+            created_at INTEGER
         )"""
     )
     conn.commit()
@@ -327,58 +358,94 @@ def mark_paid(telegram_id, gameweek):
 
 
 # ---------------------------------------------------------------------------
-# Chapa payments
+# Telebirr payments — matched against SMS forwarded from the receiving phone
 # ---------------------------------------------------------------------------
-def chapa_headers():
-    return {"Authorization": f"Bearer {CHAPA_SECRET_KEY}"}
+_TX_LABELED = re.compile(
+    r"(?:transaction|txn|trx|የግብይት)\s*(?:number|no\.?|id|code|ቁጥር\w*)?\s*(?:is|:|-)?\s*((?=[A-Za-z0-9]*\d)[A-Za-z0-9]{8,14})\b",
+    re.I,
+)
+_TX_LOOSE = re.compile(r"\b((?=[A-Z0-9]*\d)(?=[A-Z0-9]*[A-Z])[A-Z0-9]{8,14})\b")
+_TX_ONLY = re.compile(r"^[A-Za-z0-9]{8,14}$")
+_AMOUNT_RECEIVED = re.compile(r"(?:received|ተቀብለዋል)\s+(?:an\s+amount\s+of\s+)?(?:ETB|Birr|ብር)\s*([\d,]+(?:\.\d+)?)", re.I)
+_AMOUNTS = (
+    re.compile(r"(?:ETB|Birr|ብር)\s*([\d,]+(?:\.\d+)?)", re.I),
+    re.compile(r"([\d,]+(?:\.\d+)?)\s*(?:ETB|Birr|ብር)", re.I),
+)
+_SENDER = re.compile(r"from\s+(.+?)\s*(?:\(|\[|-\s|\d{6,}|on\s|\.)", re.I)
+_INCOMING_WORDS = ("received", "ተቀብለዋል", "ተቀብለዋል") + tuple(SMS_EXTRA_KEYWORDS)
 
 
-def create_payment_link(tx_ref, amount, first_name, last_name, telegram_id):
-    """Asks Chapa for a checkout URL the user can tap to pay."""
-    payload = {
-        "amount": str(amount),
-        "currency": "ETB",
-        # Chapa requires an email; users don't give us one, so we use a
-        # placeholder tied to their Telegram ID. example.com is rejected by
-        # Chapa's validator, so we use a real, universally-recognized domain.
-        # Chapa never actually emails this address.
-        "email": f"fplcontest.user{telegram_id}@gmail.com",
-        "first_name": first_name or "FPL",
-        "last_name": last_name or "Player",
-        "tx_ref": tx_ref,
-        "return_url": CHAPA_RETURN_URL,
-        # Chapa limits customization.title to 16 characters — keep this short.
-        "customization": {
-            "title": "FPL Contest",
-            "description": f"GW entry fee - {amount} ETB",
-        },
+def extract_tx_id(text):
+    """Pulls a Telebirr transaction number out of what the player typed:
+    either the bare number or the whole SMS. Returns UPPERCASE or None."""
+    text = (text or "").strip()
+    if _TX_ONLY.match(text):
+        return text.upper()
+    m = _TX_LABELED.search(text) or _TX_LOOSE.search(text.upper())
+    return m.group(1).upper() if m else None
+
+
+def parse_sms(message):
+    """Reads a Telebirr SMS. Returns {tx_id, amount, sender_name, incoming}."""
+    message = message or ""
+    m = _AMOUNT_RECEIVED.search(message)
+    if not m:
+        for pat in _AMOUNTS:
+            m = pat.search(message)
+            if m:
+                break
+    amount = None
+    if m:
+        try:
+            amount = float(m.group(1).replace(",", ""))
+        except ValueError:
+            pass
+    sm = _SENDER.search(message)
+    low = message.lower()
+    return {
+        "tx_id": extract_tx_id(message),
+        "amount": amount,
+        "sender_name": sm.group(1).strip() if sm else None,
+        "incoming": any(w in low for w in _INCOMING_WORDS),
     }
-    resp = requests.post(CHAPA_INITIALIZE_URL, json=payload, headers=chapa_headers(), timeout=15)
-    if resp.status_code != 200:
-        logger.error(f"Chapa initialize rejected ({resp.status_code}): {resp.text}")
-        return None
-    data = resp.json()
-    if data.get("status") == "success":
-        return data["data"]["checkout_url"]
-    logger.error(f"Chapa initialize returned non-success: {data}")
-    return None
 
 
-def verify_payment(tx_ref):
-    """True if Chapa confirms this transaction succeeded."""
-    resp = requests.get(CHAPA_VERIFY_URL.format(tx_ref=tx_ref), headers=chapa_headers(), timeout=15)
-    if resp.status_code != 200:
-        return False
-    data = resp.json()
-    return data.get("status") == "success" and data.get("data", {}).get("status") == "success"
+def store_incoming(tx_id, amount, sender_name, message):
+    """Saves a received payment as 'unused'. False if we already had it."""
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO incoming_payments (tx_id, amount, sender_name, message, received_at, status) "
+            "VALUES (?, ?, ?, ?, ?, 'unused')",
+            (tx_id.upper(), amount, sender_name, message, int(time.time())),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
 
 
-def start_payment(telegram_id, first_name, last_name):
-    """Shared by /pay and the app's Pay button. Returns
-    {"checkout_url", "gameweek", "deadline"} or raises ContestError."""
+def handle_sms(sender, message):
+    """Called for every SMS the phone forwards. Only genuine 'money received'
+    messages from Telebirr are stored."""
+    if (sender or "").strip().lower() not in SMS_ALLOWED_SENDERS:
+        return {"stored": False, "reason": "sender not allowed"}
+    p = parse_sms(message)
+    if not p["incoming"]:
+        return {"stored": False, "reason": "not a received-payment SMS"}
+    if not p["tx_id"] or p["amount"] is None:
+        logger.warning("Incoming SMS matched but no transaction number/amount could be read")
+        return {"stored": False, "reason": "could not read transaction number or amount"}
+    new = store_incoming(p["tx_id"], p["amount"], p["sender_name"], message)
+    logger.info("SMS payment %s %s birr (%s)", p["tx_id"], p["amount"], "new" if new else "duplicate")
+    return {"stored": new, "tx_id": p["tx_id"], "amount": p["amount"]}
+
+
+def check_can_enter(telegram_id):
+    """Raises ContestError if this player can't enter right now; otherwise
+    returns the open entry window {"gameweek", "deadline"}."""
     if not get_user(telegram_id):
-        raise ContestError("not_registered", "Please register your FPL team ID first.")
-
+        raise ContestError("not_registered", "Please link your FPL team first (on the Home screen).")
     try:
         window = get_entry_window()
     except Exception:
@@ -388,49 +455,101 @@ def start_payment(telegram_id, first_name, last_name):
         raise ContestError("deadline_unknown", "Couldn't confirm the FPL deadline right now — please try again in a moment.")
     if not window:
         raise ContestError("closed", "⛔ No gameweek is open for entries right now.")
-
-    gw = window["gameweek"]
-    existing = get_entry(telegram_id, gw)
+    existing = get_entry(telegram_id, window["gameweek"])
     if existing and existing["paid"]:
-        raise ContestError("already_paid", f"You're already confirmed and entered for GW{gw}! ✅")
+        raise ContestError("already_paid", f"You're already confirmed and entered for GW{window['gameweek']}! ✅")
+    return window
 
-    tx_ref = f"fplgw{gw}-{telegram_id}-{int(time.time())}"
+
+_fail_log = {}
+_fail_lock = threading.Lock()
+MAX_FAILS_PER_HOUR = 6
+
+
+def _too_many_fails(telegram_id):
+    now = time.time()
+    with _fail_lock:
+        recent = [t for t in _fail_log.get(telegram_id, []) if now - t < 3600]
+        _fail_log[telegram_id] = recent
+        return len(recent) >= MAX_FAILS_PER_HOUR
+
+
+def _record_fail(telegram_id):
+    with _fail_lock:
+        _fail_log.setdefault(telegram_id, []).append(time.time())
+
+
+def claim_deposit(telegram_id, text):
+    """The player submitted a transaction number / SMS. If it matches an
+    unused received payment of at least the entry fee, they're entered.
+    Returns {"gameweek", "amount", "credit"} or raises ContestError."""
+    window = check_can_enter(telegram_id)
+    gw = window["gameweek"]
+    if _too_many_fails(telegram_id):
+        raise ContestError("rate_limited", "Too many wrong attempts. Please wait a while and try again.")
+
+    tx_id = extract_tx_id(text)
+    if not tx_id:
+        _record_fail(telegram_id)
+        raise ContestError("bad_tx", "❌ I couldn't find a transaction number in that. Paste the full Telebirr SMS or just the transaction number.")
+
+    conn = _connect()
+    conn.isolation_level = None  # we run the transaction ourselves
     try:
-        checkout_url = create_payment_link(tx_ref, ENTRY_FEE_BIRR, first_name, last_name, telegram_id)
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT amount, status FROM incoming_payments WHERE tx_id=?", (tx_id,)
+        ).fetchone()
+        if not row:
+            conn.execute("ROLLBACK")
+            _record_fail(telegram_id)
+            raise ContestError(
+                "not_found",
+                "❌ Transaction number incorrect — we couldn't find that payment. Check the number and try again "
+                "(a new payment can take a minute to show up).",
+            )
+        amount, status = row
+        if status != "unused":
+            conn.execute("ROLLBACK")
+            _record_fail(telegram_id)
+            raise ContestError("used", "❌ That transaction number has already been used.")
+        if amount < ENTRY_FEE_BIRR:
+            conn.execute("ROLLBACK")
+            raise ContestError(
+                "too_small",
+                f"That payment is {amount:g} birr but the entry fee is {ENTRY_FEE_BIRR} birr. "
+                "Please contact the admin.",
+            )
+        now = int(time.time())
+        conn.execute(
+            "UPDATE incoming_payments SET status='used', used_by=?, used_at=? WHERE tx_id=?",
+            (telegram_id, now, tx_id),
+        )
+        conn.execute(
+            "INSERT INTO entries (telegram_id, gameweek, paid, tx_reference) VALUES (?, ?, 1, ?) "
+            "ON CONFLICT(telegram_id, gameweek) DO UPDATE SET paid=1, tx_reference=excluded.tx_reference",
+            (telegram_id, gw, tx_id),
+        )
+        credit = int(amount - ENTRY_FEE_BIRR)  # anything extra they sent goes to their wallet
+        if credit > 0:
+            conn.execute(
+                "INSERT INTO wallet_credits (telegram_id, amount, reason, created_at) VALUES (?, ?, ?, ?)",
+                (telegram_id, credit, f"Extra sent with GW{gw} entry ({tx_id})", now),
+            )
+        conn.execute("COMMIT")
+    except ContestError:
+        raise
     except Exception:
-        logger.exception("Chapa initialize failed")
-        checkout_url = None
-    if not checkout_url:
-        raise ContestError("gateway", "Sorry, couldn't create a payment link right now — please try again in a moment.")
-
-    db_execute(
-        "INSERT INTO entries (telegram_id, gameweek, paid, tx_reference) VALUES (?, ?, 0, ?) "
-        "ON CONFLICT(telegram_id, gameweek) DO UPDATE SET tx_reference=excluded.tx_reference",
-        (telegram_id, gw, tx_ref),
-    )
-    return {"checkout_url": checkout_url, "gameweek": gw, "deadline": window["deadline"]}
-
-
-def confirm_pending_for_user(telegram_id):
-    """Checks this user's unpaid entries with Chapa right now. Returns the
-    list of gameweeks newly confirmed."""
-    rows = db_execute(
-        "SELECT gameweek, tx_reference FROM entries WHERE telegram_id=? AND paid=0 AND tx_reference IS NOT NULL",
-        (telegram_id,),
-        fetch=True,
-    )
-    confirmed = []
-    for gw, ref in rows:
         try:
-            if verify_payment(ref) and mark_paid(telegram_id, gw):
-                add_notification(
-                    telegram_id, "payment", "Payment confirmed ✅",
-                    f"You're entered in Gameweek {gw}. Good luck!",
-                )
-                confirmed.append(gw)
+            conn.execute("ROLLBACK")
         except Exception:
-            logger.exception(f"Payment verify failed for tx_ref {ref}")
-    return confirmed
+            pass
+        raise
+    finally:
+        conn.close()
+
+    add_notification(telegram_id, "payment", "Payment confirmed ✅", f"You're entered in Gameweek {gw}. Good luck!")
+    return {"gameweek": gw, "amount": amount, "credit": credit}
 
 
 # ---------------------------------------------------------------------------
@@ -473,32 +592,127 @@ def set_gameweek_prizes(gameweek, allocation):
         record_prize(telegram_id, gameweek, amount)
 
 
+def wallet_balance(telegram_id, conn=None):
+    """Prizes + credits − withdrawals (pending or paid). Entry fees are paid
+    outside the app via Telebirr, so they don't touch the balance."""
+    own = conn is None
+    conn = conn or _connect()
+    try:
+        won = conn.execute("SELECT COALESCE(SUM(amount),0) FROM prizes WHERE telegram_id=?", (telegram_id,)).fetchone()[0]
+        cred = conn.execute("SELECT COALESCE(SUM(amount),0) FROM wallet_credits WHERE telegram_id=?", (telegram_id,)).fetchone()[0]
+        out = conn.execute(
+            "SELECT COALESCE(SUM(amount),0) FROM withdrawals WHERE telegram_id=? AND status IN ('pending','paid')",
+            (telegram_id,),
+        ).fetchone()[0]
+        return won + cred - out
+    finally:
+        if own:
+            conn.close()
+
+
 def wallet_data(telegram_id):
     entries = db_execute(
-        "SELECT gameweek, paid FROM entries WHERE telegram_id=? ORDER BY gameweek DESC",
+        "SELECT e.gameweek, e.paid, COALESCE(p.used_at, 0) FROM entries e "
+        "LEFT JOIN incoming_payments p ON p.tx_id = e.tx_reference "
+        "WHERE e.telegram_id=? AND e.paid=1",
         (telegram_id,), fetch=True,
     )
-    prizes = db_execute(
-        "SELECT gameweek, amount FROM prizes WHERE telegram_id=? ORDER BY gameweek DESC",
-        (telegram_id,), fetch=True,
+    prizes = db_execute("SELECT gameweek, amount, created_at FROM prizes WHERE telegram_id=?", (telegram_id,), fetch=True)
+    credits = db_execute("SELECT amount, created_at FROM wallet_credits WHERE telegram_id=?", (telegram_id,), fetch=True)
+    wds = db_execute(
+        "SELECT id, amount, status, created_at FROM withdrawals WHERE telegram_id=?", (telegram_id,), fetch=True
     )
-    spent = sum(ENTRY_FEE_BIRR for _, paid in entries if paid)
-    won = sum(amount for _, amount in prizes)
-    items = [
-        {"type": "prize", "gameweek": gw, "amount": amount, "status": "won"} for gw, amount in prizes
-    ] + [
-        {"type": "entry", "gameweek": gw, "amount": -ENTRY_FEE_BIRR, "status": "paid" if paid else "pending"}
-        for gw, paid in entries
-    ]
-    items.sort(key=lambda x: (-x["gameweek"], 0 if x["type"] == "prize" else 1))
+    items = (
+        [{"type": "prize", "gameweek": gw, "amount": amt, "ts": ts} for gw, amt, ts in prizes]
+        + [{"type": "credit", "amount": amt, "ts": ts} for amt, ts in credits]
+        + [{"type": "entry", "gameweek": gw, "amount": ENTRY_FEE_BIRR, "ts": ts} for gw, _, ts in entries]
+        + [{"type": "withdrawal", "id": i, "amount": amt, "status": st, "ts": ts} for i, amt, st, ts in wds]
+    )
+    items.sort(key=lambda x: (-(x["ts"] or 0), -(x.get("gameweek") or 0)))
     return {
-        "won": won,
-        "spent": spent,
-        "net": won - spent,
-        "entries": sum(1 for _, paid in entries if paid),
-        "wins": len(prizes),
+        "balance": wallet_balance(telegram_id),
+        "min_withdrawal": MIN_WITHDRAWAL,
+        "has_pending_withdrawal": any(w[2] == "pending" for w in wds),
         "items": items,
     }
+
+
+_PHONE = re.compile(r"^(?:\+?251|0)?(9|7)\d{8}$")
+
+
+def request_withdrawal(telegram_id, amount, account):
+    """Winner asks to withdraw from their wallet. Returns the new request or raises ContestError."""
+    account = re.sub(r"[\s-]", "", account or "")
+    if not _PHONE.match(account):
+        raise ContestError("bad_account", "Please enter a valid Telebirr phone number, e.g. 0912345678.")
+    if amount < MIN_WITHDRAWAL:
+        raise ContestError("too_small", f"The minimum withdrawal is {MIN_WITHDRAWAL} birr.")
+    conn = _connect()
+    conn.isolation_level = None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT 1 FROM withdrawals WHERE telegram_id=? AND status='pending'", (telegram_id,)).fetchone():
+            conn.execute("ROLLBACK")
+            raise ContestError("pending", "You already have a withdrawal waiting for the admin.")
+        balance = wallet_balance(telegram_id, conn)
+        if amount > balance:
+            conn.execute("ROLLBACK")
+            raise ContestError("insufficient", f"You only have {balance} birr available.")
+        cur = conn.execute(
+            "INSERT INTO withdrawals (telegram_id, amount, account, status, created_at) VALUES (?, ?, ?, 'pending', ?)",
+            (telegram_id, amount, account, int(time.time())),
+        )
+        wid = cur.lastrowid
+        conn.execute("COMMIT")
+    except ContestError:
+        raise
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+    return {"id": wid, "amount": amount, "account": account, "balance": wallet_balance(telegram_id)}
+
+
+def get_withdrawal(wid):
+    row = db_execute(
+        "SELECT id, telegram_id, amount, account, status FROM withdrawals WHERE id=?", (wid,), fetchone=True
+    )
+    if not row:
+        return None
+    return dict(zip(("id", "telegram_id", "amount", "account", "status"), row))
+
+
+def pending_withdrawals():
+    rows = db_execute("SELECT id FROM withdrawals WHERE status='pending' ORDER BY id", fetch=True)
+    return [get_withdrawal(r[0]) for r in rows]
+
+
+def resolve_withdrawal(wid, status):
+    """Admin marks a request 'paid' or 'rejected' (a rejected amount returns to
+    the wallet automatically). None if it was already handled."""
+    assert status in ("paid", "rejected")
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "UPDATE withdrawals SET status=?, resolved_at=? WHERE id=? AND status='pending'",
+            (status, int(time.time()), wid),
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            return None
+    finally:
+        conn.close()
+    return get_withdrawal(wid)
+
+
+def withdrawal_text(w):
+    me = get_user(w["telegram_id"])
+    who = f"{me['username']} · FPL \"{me['team_name']}\"" if me else str(w["telegram_id"])
+    return f"💸 Withdrawal request #{w['id']}\nPlayer: {who}\nAmount: {w['amount']} birr\nSend to Telebirr: {w['account']}"
 
 
 def add_notification(telegram_id, kind, title, body):
