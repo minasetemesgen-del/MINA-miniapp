@@ -14,7 +14,7 @@
     plSeg: "table",
     statKey: "goals",
     countdown: null,
-    payPoll: null,
+    wallet: { mode: "deposit", method: null },
   };
 
   /* ------------------------------------------------------------------ */
@@ -239,7 +239,7 @@
 
     html += `<div class="card"><h3 style="margin-bottom:6px">How it works</h3><ol class="steps">
       <li><div><b>Link your FPL team</b><div class="muted small">One time only.</div></div></li>
-      <li><div><b>Pay ${d.fee} birr</b><div class="muted small">Telebirr, CBE Birr or card — confirmed automatically.</div></div></li>
+      <li><div><b>Pay ${d.fee} birr</b><div class="muted small">Send it on Telebirr, then submit the transaction number — verified in seconds.</div></div></li>
       <li><div><b>Top 3 win</b><div class="muted small">The three best gameweek scores win prizes.</div></div></li>
     </ol></div></div>`;
 
@@ -247,7 +247,6 @@
     $("#bell-dot").hidden = !d.unread;
     $("#bell-dot").textContent = d.unread > 9 ? "9+" : d.unread;
     if (e) startCountdown(e.deadline);
-    if (e && e.pending && !state.payPoll) checkPay(true);
   }
 
   function heroHtml(d) {
@@ -260,9 +259,6 @@
     if (e.paid) cta = `<div class="center"><span class="pill ok" style="font-size:14px;padding:9px 16px">✓ You're in for Gameweek ${e.gameweek}</span></div>`;
     else if (closed) cta = `<div class="center"><span class="pill warn">Entries closed</span></div>`;
     else if (!d.registered) cta = `<button class="btn" data-act="focus-reg">Link your team to enter</button>`;
-    else if (e.pending)
-      cta = `<button class="btn" data-act="pay">Complete payment · ${d.fee} birr</button>
-             <button class="btn ghost small" style="margin-top:10px;width:100%;background:rgba(255,255,255,.12);color:#fff;border:0" data-act="pay-check">I've paid — check now</button>`;
     else cta = `<button class="btn" data-act="pay">Enter Gameweek ${e.gameweek} · ${d.fee} birr</button>`;
 
     return `<div class="card hero">
@@ -316,39 +312,59 @@
     if (tg && tg.openLink) tg.openLink(url);
     else window.open(url, "_blank");
   }
-  async function startPay(btn) {
+  function goDeposit() {
+    state.wallet = { mode: "deposit", method: "telebirr" };
+    delete state.cache.wallet;
+    showTab("wallet");
+  }
+  async function copyText(v) {
+    try { await navigator.clipboard.writeText(v); }
+    catch (_) {
+      const t = document.createElement("textarea");
+      t.value = v; document.body.appendChild(t); t.select();
+      try { document.execCommand("copy"); } catch (__) {}
+      t.remove();
+    }
+    haptic("light");
+    toast("Copied ✅");
+  }
+  async function submitDeposit(btn) {
+    const text = ($("#dep-text").value || "").trim();
+    const err = $("#dep-err");
+    err.hidden = true;
+    if (!text) { err.textContent = "Please paste the Telebirr SMS or type the transaction number."; err.hidden = false; return; }
     busy(btn, true);
     try {
-      const r = await api("/pay", { method: "POST" });
-      haptic("medium");
-      openExternal(r.checkout_url);
-      toast("Finish the payment, then come back — it confirms automatically.");
-      beginPayPolling();
-    } catch (e) { hapticNotify("error"); toast(e.message, true); }
+      const r = await api("/deposit", { method: "POST", body: JSON.stringify({ text }) });
+      hapticNotify("success");
+      toast(r.credit ? `You're in! ✅ ${r.credit} birr extra went to your wallet.` : "Payment confirmed — you're in! ✅");
+      state.cache = {};
+      showTab("home");
+    } catch (e) {
+      hapticNotify("error");
+      err.textContent = e.message;
+      err.hidden = false;
+    }
     busy(btn, false);
   }
-  function beginPayPolling() {
-    clearInterval(state.payPoll);
-    let tries = 0;
-    state.payPoll = setInterval(() => {
-      if (++tries > 60) return stopPayPolling();
-      checkPay(true);
-    }, 4000);
-  }
-  function stopPayPolling() { clearInterval(state.payPoll); state.payPoll = null; }
-  async function checkPay(quiet) {
+  async function submitWithdraw(btn) {
+    const amount = parseInt($("#wd-amount").value, 10);
+    const account = ($("#wd-account").value || "").trim();
+    const err = $("#wd-err");
+    err.hidden = true;
+    const fail = (m) => { err.textContent = m; err.hidden = false; };
+    if (!Number.isInteger(amount) || amount <= 0) return fail("Please enter the amount you want to withdraw.");
+    if (!account) return fail("Please enter your Telebirr number.");
+    busy(btn, true);
     try {
-      const r = await api("/pay/check", { method: "POST" });
-      if (r.paid) {
-        stopPayPolling();
-        hapticNotify("success");
-        toast("Payment confirmed — you're in! ✅");
-        state.cache = {};
-        if (state.tab === "home") showTab("home", { silent: true });
-      } else if (!quiet) toast("Not confirmed yet — give it a few seconds after paying.");
-    } catch (e) { if (!quiet) toast(e.message, true); }
+      await api("/withdraw", { method: "POST", body: JSON.stringify({ amount, account }) });
+      hapticNotify("success");
+      toast("Request sent — the admin will pay you soon 💸");
+      state.cache = {};
+      showTab("wallet");
+    } catch (e) { hapticNotify("error"); fail(e.message); }
+    busy(btn, false);
   }
-  document.addEventListener("visibilitychange", () => { if (!document.hidden && state.payPoll) checkPay(true); });
 
   /* ------------------------------------------------------------------ */
   /* Leaderboard (Top 10)                                                */
@@ -486,25 +502,78 @@
   /* ------------------------------------------------------------------ */
   /* Wallet                                                              */
   /* ------------------------------------------------------------------ */
-  function paintWallet(d) {
-    const sign = (n) => (n > 0 ? "+" : n < 0 ? "−" : "");
-    const rows = d.items.map((t) => {
-      const prize = t.type === "prize";
-      const sub = prize ? `Winner of gameweek ${t.gameweek}` : t.status === "paid" ? "Paid" : "Waiting for payment";
-      return `<div class="lb-row"><div class="rank" style="font-size:20px">${prize ? "🏆" : "🎟️"}</div>
-        <div class="grow"><b>${prize ? "Prize" : "Entry fee"} · GW${t.gameweek}</b><span class="muted small" style="display:block">${sub}</span></div>
-        <div class="score" style="${prize ? "color:var(--accent)" : ""}">${sign(t.amount)}${Math.abs(t.amount).toLocaleString()}<span class="muted small" style="font-weight:600"> birr</span></div></div>`;
+  const fmt2 = (n) => Number(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const methodRow = () => `<button class="method" data-act="wmethod" data-m="telebirr"><span class="method-ico">📱</span><b>TELEBIRR ቴሌብር</b><span class="muted">›</span></button>`;
+  const methodHead = () => `<button class="link-btn" data-act="wback" style="margin-bottom:8px">‹ Change method</button><div class="method-head"><span class="method-ico">📱</span><b>TELEBIRR ቴሌብር</b></div>`;
+
+  function depositPanel(d, w) {
+    if (!w.method) return `<div class="muted small" style="margin-bottom:10px">Choose a deposit method</div>${methodRow()}`;
+    if (!d.deposit.ok) return `${methodHead()}<div class="note">${esc(d.deposit.message)}</div>`;
+    if (!d.account.number) return `${methodHead()}<div class="note">Payment details haven't been set up yet. Please contact the admin.</div>`;
+    return `${methodHead()}
+      <div class="field-label">How to pay · መመሪያ</div>
+      <div class="note"><ol class="how">
+        <li>Copy the account number below.</li>
+        <li>Send <b>${d.fee} birr</b> to it on Telebirr.</li>
+        <li>Copy the SMS Telebirr sends you (or just the transaction number).</li>
+        <li>Paste it below and tap <b>Submit deposit</b>.</li></ol>
+        <div class="amh">1. ስልክ ቁጥሩን ኮፒ ያድርጉ።<br>2. ክፍያውን በቴሌብር ይፈጽሙ።<br>3. ከቴሌብር የደረሰዎትን SMS መልእክት ኮፒ አድርገው ያስገቡ።<br>4. "SUBMIT DEPOSIT" የሚለውን ይጫኑ።</div></div>
+      <div class="field-label">Account details</div>
+      <div class="kv">
+        <div><span>Bank</span><b>Telebirr ቴሌብር</b></div>
+        ${d.account.name ? `<div><span>Account name</span><b>${esc(d.account.name)}</b></div>` : ""}
+        <div><span>Account number</span><b>${esc(d.account.number)}</b><button class="copy" data-act="copy" data-val="${esc(d.account.number)}">Copy</button></div>
+        <div><span>Amount to send</span><b>${d.fee} birr</b></div>
+      </div>
+      <div class="field-label">SMS or transaction number</div>
+      <textarea id="dep-text" class="input" rows="5" maxlength="2000" autocomplete="off" placeholder="Paste the full Telebirr SMS here, or just the transaction number."></textarea>
+      <div id="dep-err" class="errtext" hidden></div>
+      <button class="btn" style="margin-top:12px" data-act="deposit">Submit deposit</button>`;
+  }
+
+  function withdrawPanel(d, w) {
+    if (!w.method) return `<div class="muted small" style="margin-bottom:10px">Choose a payout method</div>${methodRow()}`;
+    if (d.has_pending_withdrawal)
+      return `${methodHead()}<div class="note">You have a withdrawal waiting for the admin. You can ask for another one once it's been handled.</div>`;
+    if (d.balance < d.min_withdrawal)
+      return `${methodHead()}<div class="note">Only winners can withdraw. Prize money shows up in your balance after the admin announces a gameweek's winners.<br><br>Minimum withdrawal is ETB ${d.min_withdrawal}.</div>`;
+    return `${methodHead()}
+      <div class="field-label">Amount</div>
+      <input id="wd-amount" class="input" inputmode="numeric" pattern="[0-9]*" placeholder="Amount" autocomplete="off">
+      <div class="hint">Minimum withdrawal is ETB ${d.min_withdrawal} · Available ETB ${fmt2(d.balance)}</div>
+      <div class="field-label">Telebirr number</div>
+      <input id="wd-account" class="input" inputmode="tel" placeholder="e.g. 0912345678" autocomplete="off">
+      <div id="wd-err" class="errtext" hidden></div>
+      <button class="btn" style="margin-top:12px" data-act="withdraw">Request withdrawal</button>`;
+  }
+
+  function historyHtml(d) {
+    if (!d.items.length) return `<div class="muted small" style="padding:0 4px">No transactions yet.</div>`;
+    const WD = { pending: "Waiting for the admin", paid: "Sent to your Telebirr", rejected: "Not processed — returned to your wallet" };
+    return d.items.map((t) => {
+      let ico, title, sub, amt, style = "";
+      if (t.type === "prize") { ico = "🏆"; title = `Prize · GW${t.gameweek}`; sub = "Gameweek winner"; amt = `+${fmt2(t.amount)}`; style = "color:var(--accent)"; }
+      else if (t.type === "credit") { ico = "💼"; title = "Extra payment added"; sub = "You sent more than the entry fee"; amt = `+${fmt2(t.amount)}`; style = "color:var(--accent)"; }
+      else if (t.type === "entry") { ico = "🎟️"; title = `Entry · GW${t.gameweek}`; sub = "Paid via Telebirr"; amt = fmt2(t.amount); style = "color:var(--muted)"; }
+      else { ico = "💸"; title = "Withdrawal"; sub = WD[t.status] || t.status; amt = `−${fmt2(t.amount)}`; style = t.status === "rejected" ? "color:var(--muted);text-decoration:line-through" : ""; }
+      return `<div class="lb-row"><div class="rank" style="font-size:20px">${ico}</div>
+        <div class="grow"><b>${title}</b><span class="muted small" style="display:block">${sub}${t.ts ? " · " + ago(t.ts) : ""}</span></div>
+        <div class="score" style="${style}">${amt}</div></div>`;
     }).join("");
+  }
+
+  function paintWallet(d, force) {
+    if (!d) return;
+    // don't wipe what someone is typing when fresh data arrives
+    const typing = ["dep-text", "wd-amount", "wd-account"].some((id) => { const el = $("#" + id); return el && el.value; });
+    if (!force && typing) return;
+    const w = state.wallet;
+    const tabs = [["deposit", "Deposit"], ["withdraw", "Withdraw"]]
+      .map(([m, l]) => `<button class="${w.mode === m ? "active" : ""}" data-act="wmode" data-mode="${m}">${l}</button>`).join("");
     view.innerHTML = `<div class="stack fade-in">
-      <div class="hero"><div class="eyebrow">Total winnings</div>
-        <div class="big">${d.won.toLocaleString()} <span style="font-size:18px;font-weight:700">birr</span></div>
-        <div class="sub">${d.wins} gameweek win${d.wins === 1 ? "" : "s"} · ${d.entries} entr${d.entries === 1 ? "y" : "ies"} played</div>
-        <div class="stats" style="grid-template-columns:1fr 1fr;margin-bottom:0">
-          <div class="stat"><b>${d.spent.toLocaleString()}</b><span>Entry fees paid</span></div>
-          <div class="stat"><b>${sign(d.net)}${Math.abs(d.net).toLocaleString()}</b><span>Net (birr)</span></div></div></div>
-      <div class="section-title" style="margin:6px 4px 0">Activity</div>
-      ${rows || emptyState("👛", "No activity yet", "Your entry fees and prizes will show up here.")}
-      <p class="muted small center" style="margin-top:4px">Prizes appear here once the admin announces a gameweek winner.</p></div>`;
+      <div><h2 style="font-size:26px">Wallet</h2><div class="wallet-balance">ETB ${fmt2(d.balance)}</div></div>
+      <div class="card"><div class="segment" style="margin:0 0 14px">${tabs}</div>${w.mode === "deposit" ? depositPanel(d, w) : withdrawPanel(d, w)}</div>
+      <div><div class="section-title" style="margin:4px 4px 8px">History</div>${historyHtml(d)}</div></div>`;
   }
 
   /* ------------------------------------------------------------------ */
@@ -614,8 +683,13 @@
     switch (el.dataset.act) {
       case "register": return registerTeam(el);
       case "focus-reg": { const i = $("#team-id"); if (i) i.focus(); return; }
-      case "pay": return startPay(el);
-      case "pay-check": return checkPay(false);
+      case "pay": return goDeposit();
+      case "wmode": haptic(); state.wallet = { mode: el.dataset.mode, method: null }; return paintWallet(state.cache.wallet, true);
+      case "wmethod": haptic(); state.wallet.method = el.dataset.m; return paintWallet(state.cache.wallet, true);
+      case "wback": state.wallet.method = null; return paintWallet(state.cache.wallet, true);
+      case "copy": return copyText(el.dataset.val);
+      case "deposit": return submitDeposit(el);
+      case "withdraw": return submitWithdraw(el);
       case "goto": return showTab(el.dataset.tab);
       case "retry": delete state.cache[cacheKey(state.tab)]; return showTab(state.tab);
       case "gw-prev": return gotoGw((state.fixturesGw || state.fixturesCurrent) - 1);
