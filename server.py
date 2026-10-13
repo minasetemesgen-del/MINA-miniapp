@@ -28,7 +28,10 @@ from pydantic import BaseModel
 
 import core
 import fpl_views
-from config import ADMIN_TELEGRAM_ID, BOT_TOKEN, DEV_MODE, ENTRY_FEE_BIRR, RUN_BOT, WEBAPP_URL
+from config import (
+    ADMIN_TELEGRAM_ID, BOT_TOKEN, DEV_MODE, ENTRY_FEE_BIRR, RUN_BOT,
+    SMS_WEBHOOK_SECRET, TELEBIRR_NAME, TELEBIRR_NUMBER, WEBAPP_URL,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -52,6 +55,7 @@ async def lifespan(app: FastAPI):
         import bot
 
         tg_app = bot.build_application()
+        app.state.tg_app = tg_app  # lets API handlers message the admin
         await tg_app.initialize()
         await tg_app.start()
         await tg_app.updater.start_polling()
@@ -217,27 +221,74 @@ def register(body: RegisterBody, user: dict = Depends(current_user)):
     return {"ok": True, "team": {"id": body.team_id, "name": info["name"]}}
 
 
-@app.post("/api/pay")
-def pay(user: dict = Depends(current_user)):
-    result = core.start_payment(user["id"], user.get("first_name"), user.get("last_name"))
-    return {
-        "checkout_url": result["checkout_url"],
-        "gameweek": result["gameweek"],
-        "deadline": _iso(result["deadline"]),
-    }
+class DepositBody(BaseModel):
+    text: str
 
 
-@app.post("/api/pay/check")
-def pay_check(user: dict = Depends(current_user)):
-    """The app calls this while the user is paying, so the entry is confirmed
-    the instant Chapa says yes instead of waiting for the background job."""
-    confirmed = core.confirm_pending_for_user(user["id"])
-    window = core.get_entry_window()
-    paid = False
-    if window:
-        entry = core.get_entry(user["id"], window["gameweek"])
-        paid = bool(entry and entry["paid"])
-    return {"paid": paid, "confirmed": confirmed}
+@app.post("/api/deposit")
+def deposit(body: DepositBody, user: dict = Depends(current_user)):
+    """The player pays on Telebirr, then submits the transaction number (or
+    the whole SMS). If it matches a payment our phone received, they're in."""
+    if len(body.text) > 2000:
+        raise core.ContestError("too_long", "That's too long — paste just the Telebirr SMS or the transaction number.")
+    result = core.claim_deposit(user["id"], body.text)
+    return {"ok": True, **result}
+
+
+class WithdrawBody(BaseModel):
+    amount: int
+    account: str
+
+
+@app.post("/api/withdraw")
+async def withdraw(body: WithdrawBody, user: dict = Depends(current_user)):
+    """Only people with money in their wallet (winners) can get past this."""
+    w = core.request_withdrawal(user["id"], body.amount, body.account)
+    tg_app = getattr(app.state, "tg_app", None)
+    if tg_app:
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+        try:
+            await tg_app.bot.send_message(
+                ADMIN_TELEGRAM_ID,
+                core.withdrawal_text(core.get_withdrawal(w["id"])),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Mark paid", callback_data=f"wd:paid:{w['id']}"),
+                    InlineKeyboardButton("❌ Reject", callback_data=f"wd:reject:{w['id']}"),
+                ]]),
+            )
+        except Exception:
+            logger.exception("Could not notify the admin about withdrawal %s", w["id"])
+    return {"ok": True, "id": w["id"], "balance": w["balance"]}
+
+
+@app.post("/api/sms-hook")
+async def sms_hook(request: Request):
+    """Called by the SMS-forwarder app on your receiving phone for every SMS.
+    Protected by SMS_WEBHOOK_SECRET so nobody can fake a payment."""
+    if not SMS_WEBHOOK_SECRET:
+        raise HTTPException(503, "SMS webhook is not configured.")
+    given = request.headers.get("x-webhook-secret") or request.query_params.get("secret") or ""
+    if not hmac.compare_digest(given.encode(), SMS_WEBHOOK_SECRET.encode()):
+        raise HTTPException(401, "Bad secret.")
+    raw = await request.body()
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        data = dict(parse_qsl(raw.decode("utf-8", "ignore")))
+    if not isinstance(data, dict):
+        raise HTTPException(400, "Expected a JSON object.")
+
+    def pick(*keys):
+        for k in keys:
+            if data.get(k):
+                return str(data[k])
+        return ""
+
+    sender = pick("sender", "from", "address", "number", "phone")
+    message = pick("message", "text", "body", "content", "sms")
+    result = core.handle_sms(sender, message)  # always 200, so the phone app doesn't keep retrying
+    return {"ok": True, **result}
 
 
 @app.get("/api/leaderboard")
@@ -325,6 +376,12 @@ def news(user: dict = Depends(current_user)):
 def wallet(user: dict = Depends(current_user)):
     data = core.wallet_data(user["id"])
     data["fee"] = ENTRY_FEE_BIRR
+    data["account"] = {"name": TELEBIRR_NAME, "number": TELEBIRR_NUMBER}
+    try:
+        w = core.check_can_enter(user["id"])
+        data["deposit"] = {"ok": True, "gameweek": w["gameweek"], "deadline": _iso(w["deadline"])}
+    except core.ContestError as e:
+        data["deposit"] = {"ok": False, "code": e.code, "message": e.message}
     return data
 
 
