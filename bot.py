@@ -14,14 +14,15 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 import core
 from config import (
     ADMIN_TELEGRAM_ID,
     BOT_TOKEN,
     ENTRY_FEE_BIRR,
-    PAYMENT_CHECK_INTERVAL_SECONDS,
+    TELEBIRR_NAME,
+    TELEBIRR_NUMBER,
     WEBAPP_URL,
 )
 
@@ -59,12 +60,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "fixtures, your team and transfers.\n\n"
         "Or use commands:\n"
         "/register <your_FPL_team_id> - link your FPL team\n"
-        "/pay - get your payment link (Telebirr, CBE Birr, or card)\n"
+        "/pay - how to pay the entry fee (Telebirr)\n"
+        "/deposit <transaction no. or SMS> - confirm your payment\n"
         "/mystatus - check your registration & payment status\n"
         "/leaderboard - see this gameweek's top 10\n"
         "/app - open the Mini App\n\n"
-        "Payments confirm automatically within about a minute — no need to "
-        "message anyone.",
+        "Pay on Telebirr, then submit your transaction number — you're entered "
+        "the moment it's verified.",
         reply_markup=app_keyboard(),
     )
 
@@ -108,49 +110,56 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def pay_instructions(window):
+    if not TELEBIRR_NUMBER:
+        return "Payments aren't set up yet — please contact the admin."
+    name = f" ({TELEBIRR_NAME})" if TELEBIRR_NAME else ""
+    return (
+        f"💰 Entry fee: {ENTRY_FEE_BIRR} birr for Gameweek {window['gameweek']}\n"
+        f"⏰ Entries close {fmt_deadline(window['deadline'])}\n\n"
+        f"1. Send {ENTRY_FEE_BIRR} birr on Telebirr to:\n{TELEBIRR_NUMBER}{name}\n"
+        "2. Copy the transaction number from the Telebirr SMS you get.\n"
+        "3. Send it here:  /deposit <transaction number>\n"
+        "    (or paste it in the app: Wallet → Deposit)\n\n"
+        "You're entered as soon as it's verified."
+    )
+
+
 async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
     try:
-        result = await asyncio.to_thread(core.start_payment, user.id, user.first_name, user.last_name)
+        window = await asyncio.to_thread(core.check_can_enter, update.effective_user.id)
     except core.ContestError as e:
         await update.message.reply_text(e.message)
         return
     except Exception:
-        logger.exception("start_payment failed")
+        logger.exception("pay failed")
         await update.message.reply_text("Sorry, something went wrong — please try again in a moment.")
         return
+    await update.message.reply_text(pay_instructions(window), reply_markup=app_keyboard("Open Wallet"))
 
+
+async def deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /deposit <transaction number>\n\nPay first with /pay, then send the transaction "
+            "number from the Telebirr SMS (or paste the whole SMS after the command)."
+        )
+        return
+    text = " ".join(context.args)
+    try:
+        r = await asyncio.to_thread(core.claim_deposit, update.effective_user.id, text)
+    except core.ContestError as e:
+        await update.message.reply_text(e.message)
+        return
+    except Exception:
+        logger.exception("deposit failed")
+        await update.message.reply_text("Sorry, something went wrong — please try again in a moment.")
+        return
+    extra = f"\n💼 {r['credit']} birr extra was added to your wallet." if r["credit"] else ""
     await update.message.reply_text(
-        f"💰 Entry fee: {ENTRY_FEE_BIRR} birr for Gameweek {result['gameweek']}\n"
-        f"⏰ Entries close {fmt_deadline(result['deadline'])}\n\n"
-        f"Tap to pay (Telebirr, CBE Birr, or card):\n{result['checkout_url']}\n\n"
-        "Once payment completes, you'll be entered automatically within a "
-        "minute — no need to do anything else. Check /mystatus anytime."
+        f"✅ Payment verified! You're entered in GW{r['gameweek']}. Good luck!{extra}",
+        reply_markup=app_keyboard("📊 Open app"),
     )
-
-
-async def check_pending_payments(context: ContextTypes.DEFAULT_TYPE):
-    """Background job: automatically verifies all pending payments with Chapa
-    and confirms entries with zero admin involvement."""
-    pending = core.db_execute(
-        "SELECT telegram_id, gameweek, tx_reference FROM entries WHERE paid=0 AND tx_reference IS NOT NULL",
-        fetch=True,
-    )
-    for telegram_id, gw, tx_ref in pending:
-        try:
-            if await asyncio.to_thread(core.verify_payment, tx_ref) and core.mark_paid(telegram_id, gw):
-                core.add_notification(
-                    telegram_id, "payment", "Payment confirmed ✅",
-                    f"You're entered in Gameweek {gw}. Good luck!",
-                )
-                await context.bot.send_message(
-                    telegram_id,
-                    f"✅ Payment confirmed automatically! You're entered in GW{gw}. Good luck!",
-                    reply_markup=app_keyboard("📊 Open app"),
-                )
-                logger.info(f"Auto-confirmed payment for {telegram_id}, GW{gw}")
-        except Exception:
-            logger.exception(f"Payment verify failed for tx_ref {tx_ref}")
 
 
 async def deadline_reminders(context: ContextTypes.DEFAULT_TYPE):
@@ -207,12 +216,8 @@ async def my_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gw = window["gameweek"]
     entry = core.get_entry(user.id, gw)
     status = "Not entered this gameweek yet — run /pay."
-    if entry:
-        status = (
-            "✅ Payment confirmed, you're entered!"
-            if entry["paid"]
-            else "⏳ Waiting for payment to complete — check back in a minute after paying."
-        )
+    if entry and entry["paid"]:
+        status = "✅ Payment confirmed, you're entered!"
     await update.message.reply_text(
         f"FPL Team: {team}\nGameweek {gw} (closes {fmt_deadline(window['deadline'])}):\n{status}",
         reply_markup=app_keyboard(),
@@ -293,6 +298,88 @@ async def announce_winner(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def parse_sms_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /parsesms <paste a Telebirr SMS> — shows what the app would read from it.
+    Use it to check your real SMS format is understood."""
+    if not is_admin(update):
+        await update.message.reply_text("Admins only.")
+        return
+    text = update.message.text.partition(" ")[2].strip()
+    if not text:
+        await update.message.reply_text("Usage: /parsesms <paste the Telebirr SMS>")
+        return
+    p = core.parse_sms(text)
+    ok = p["incoming"] and p["tx_id"] and p["amount"] is not None
+    await update.message.reply_text(
+        f"Transaction no.: {p['tx_id']}\nAmount: {p['amount']}\nFrom: {p['sender_name']}\n"
+        f"Counts as money received: {'yes' if p['incoming'] else 'NO'}\n\n"
+        + ("✅ This SMS would be accepted." if ok else "⚠️ This SMS would NOT be accepted — send me the text so I can adjust the reader.")
+    )
+
+
+async def add_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /addpayment <txid> <amount> — records a payment by hand (e.g. the phone was offline)."""
+    if not is_admin(update):
+        await update.message.reply_text("Admins only.")
+        return
+    try:
+        tx_id, amount = context.args[0].upper(), float(context.args[1])
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: /addpayment <transaction number> <amount in birr>")
+        return
+    new = core.store_incoming(tx_id, amount, "added by admin", "manual")
+    await update.message.reply_text(
+        f"✅ Recorded {tx_id} ({amount:g} birr). The player can submit it now."
+        if new else f"{tx_id} is already recorded."
+    )
+
+
+async def list_withdrawals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text("Admins only.")
+        return
+    pending = core.pending_withdrawals()
+    if not pending:
+        await update.message.reply_text("No withdrawal requests waiting.")
+        return
+    for w in pending:
+        await update.message.reply_text(core.withdrawal_text(w), reply_markup=withdrawal_keyboard(w["id"]))
+
+
+def withdrawal_keyboard(wid):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Mark paid", callback_data=f"wd:paid:{wid}"),
+        InlineKeyboardButton("❌ Reject", callback_data=f"wd:reject:{wid}"),
+    ]])
+
+
+async def withdrawal_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_TELEGRAM_ID:
+        await q.answer("Admins only.", show_alert=True)
+        return
+    _, action, wid = q.data.split(":")
+    paid = action == "paid"
+    w = core.resolve_withdrawal(int(wid), "paid" if paid else "rejected")
+    if not w:
+        await q.answer("Already handled.")
+        await q.edit_message_reply_markup(None)
+        return
+    await q.answer("Done")
+    await q.edit_message_text(
+        f"{q.message.text}\n\n" + ("✅ Marked as paid" if paid else "❌ Rejected — the amount went back to their wallet")
+    )
+    if paid:
+        title, body = "Withdrawal sent 💸", f"{w['amount']} birr was sent to {w['account']} on Telebirr."
+    else:
+        title, body = "Withdrawal not processed", f"Your {w['amount']} birr request was rejected and returned to your wallet."
+    core.add_notification(w["telegram_id"], "payment", title, body)
+    try:
+        await context.bot.send_message(w["telegram_id"], f"{title}\n{body}")
+    except Exception:
+        logger.warning("Could not message %s about their withdrawal", w["telegram_id"])
+
+
 # ---------------------------------------------------------------------------
 # Wiring
 # ---------------------------------------------------------------------------
@@ -303,13 +390,15 @@ def build_application():
     app.add_handler(CommandHandler("app", open_app))
     app.add_handler(CommandHandler("register", register))
     app.add_handler(CommandHandler("pay", pay))
+    app.add_handler(CommandHandler("deposit", deposit))
     app.add_handler(CommandHandler("mystatus", my_status))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("announcewinner", announce_winner))
+    app.add_handler(CommandHandler("parsesms", parse_sms_cmd))
+    app.add_handler(CommandHandler("addpayment", add_payment))
+    app.add_handler(CommandHandler("withdrawals", list_withdrawals))
+    app.add_handler(CallbackQueryHandler(withdrawal_action, pattern=r"^wd:(paid|reject):\d+$"))
 
-    # Automatically checks Chapa for completed payments in the background —
-    # this is what makes confirmation fully automatic, no admin needed.
-    app.job_queue.run_repeating(check_pending_payments, interval=PAYMENT_CHECK_INTERVAL_SECONDS, first=10)
     app.job_queue.run_repeating(deadline_reminders, interval=600, first=60)
     return app
 
