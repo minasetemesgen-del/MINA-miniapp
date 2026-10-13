@@ -355,3 +355,26 @@ img { display: block; }
 .pl-logo { display: block; width: 24px; height: 24px; background: currentColor;
   -webkit-mask: url(/pl-icon.png) center / contain no-repeat; mask: url(/pl-icon.png) center / contain no-repeat; }
 .tabbar button.active .pl-logo { filter: drop-shadow(0 0 8px color-mix(in srgb, var(--accent) 60%, transparent)); }
+
+/* ---------- Wallet: deposit / withdraw ---------- */
+.wallet-balance { font-size: 34px; font-weight: 900; color: var(--accent); letter-spacing: -.5px; margin-top: 2px; }
+.method { display: flex; align-items: center; gap: 12px; width: 100%; padding: 14px; margin-bottom: 8px; text-align: left; background: var(--surface-2); border: 1px solid var(--line); border-radius: 14px; color: var(--text); }
+.method b { flex: 1; font-size: 14px; letter-spacing: .3px; }
+.method-ico { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 10px; background: color-mix(in srgb, var(--accent) 18%, var(--surface)); font-size: 17px; flex: none; }
+.method-head { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }
+.method-head b { font-size: 16px; letter-spacing: .3px; }
+.field-label { margin: 16px 2px 8px; font-size: 12px; font-weight: 800; letter-spacing: .8px; text-transform: uppercase; color: var(--muted); }
+.note { padding: 14px; border-radius: 14px; background: var(--surface-2); border: 1px solid var(--line); font-size: 14px; line-height: 1.5; }
+.note .how { margin: 0 0 10px; padding-left: 20px; }
+.note .how li { margin: 3px 0; }
+.note .amh { padding-top: 10px; border-top: 1px dashed var(--line); color: var(--muted); font-size: 13.5px; line-height: 1.7; }
+.kv { border-radius: 14px; background: var(--surface-2); border: 1px solid var(--line); overflow: hidden; }
+.kv > div { display: flex; align-items: center; gap: 10px; padding: 12px 14px; font-size: 14px; }
+.kv > div + div { border-top: 1px solid var(--line); }
+.kv span { color: var(--muted); flex: 1; }
+.kv b { text-align: right; }
+.kv .copy { padding: 5px 11px; border-radius: 8px; background: var(--accent); color: var(--on-accent); font-weight: 800; font-size: 12.5px; }
+textarea.input { resize: vertical; min-height: 110px; line-height: 1.45; }
+.hint { margin: 6px 2px 0; font-size: 12.5px; color: var(--muted); }
+.errtext { margin-top: 10px; padding: 11px 13px; border-radius: 12px; background: color-mix(in srgb, #ff4d6d 16%, var(--surface)); border: 1px solid color-mix(in srgb, #ff4d6d 45%, transparent); color: var(--text); font-size: 14px; font-weight: 600; }
+.errtext[hidden] { display: none; }
